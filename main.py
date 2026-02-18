@@ -1,0 +1,195 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+from collections import deque
+
+# ================== MediaPipe ==================
+mp_face = mp.solutions.face_mesh
+face_mesh = mp_face.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# ================== Eye & Iris ==================
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+LEFT_IRIS = [468, 469, 470, 471]
+RIGHT_IRIS = [472, 473, 474, 475]
+
+def eye_aspect_ratio(eye):
+    A = np.linalg.norm(eye[1] - eye[5])
+    B = np.linalg.norm(eye[2] - eye[4])
+    C = np.linalg.norm(eye[0] - eye[3])
+    return (A + B) / (2.0 * C)
+
+def iris_offset(eye_pts, iris_pts):
+    eye_center = np.mean(eye_pts, axis=0)
+    iris_center = np.mean(iris_pts, axis=0)
+    return iris_center[0] - eye_center[0]
+
+# ================== Head Pose ==================
+FACE_3D = np.array([
+    (0.0, 0.0, 0.0),
+    (0.0, -330.0, -65.0),
+    (-225.0, 170.0, -135.0),
+    (225.0, 170.0, -135.0),
+    (-150.0, -150.0, -125.0),
+    (150.0, -150.0, -125.0)
+], dtype=np.float64)
+
+LANDMARK_IDS = [1, 152, 33, 263, 61, 291]
+
+# ================== Camera ==================
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    raise RuntimeError("❌ لم يتم فتح الكاميرا")
+
+# ================== CALIBRATION ==================
+print("🟡 Calibration: انظر للأمام وارمش طبيعيًا (10 ثواني)")
+calibration_ears = []
+start = time.time()
+
+while time.time() - start < 10:
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    h, w = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    res = face_mesh.process(rgb)
+
+    if res.multi_face_landmarks:
+        face = res.multi_face_landmarks[0]
+        left_eye = np.array([[face.landmark[i].x*w, face.landmark[i].y*h] for i in LEFT_EYE])
+        right_eye = np.array([[face.landmark[i].x*w, face.landmark[i].y*h] for i in RIGHT_EYE])
+        ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2
+        calibration_ears.append(ear)
+
+    cv2.putText(frame, "Calibrating...", (20,50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+    cv2.imshow("Calibration", frame)
+    cv2.waitKey(1)
+
+cv2.destroyWindow("Calibration")
+
+mean_ear = np.mean(calibration_ears)
+std_ear = np.std(calibration_ears)
+EAR_THRESHOLD = mean_ear - std_ear
+DROWSY_TIME = 1.0
+GAZE_THRESHOLD = 6
+
+print(f"✅ Calibration done | EAR_THRESHOLD = {EAR_THRESHOLD:.3f}")
+
+# ================== Temporal & Stats ==================
+state_buffer = deque(maxlen=30)
+eye_closed_start = None
+
+time_stats = {"Attentive":0.0, "Distracted":0.0, "Drowsy":0.0}
+last_state = "Attentive"
+last_time = time.time()
+
+print("✅ FocusGuard AI – FINAL SYSTEM (Q للخروج)")
+
+# ================== Runtime ==================
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    h, w = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    res = face_mesh.process(rgb)
+
+    state = "Attentive"
+
+    if res.multi_face_landmarks:
+        face = res.multi_face_landmarks[0]
+
+        # ---------- Eye EAR ----------
+        left_eye = np.array([[face.landmark[i].x*w, face.landmark[i].y*h] for i in LEFT_EYE])
+        right_eye = np.array([[face.landmark[i].x*w, face.landmark[i].y*h] for i in RIGHT_EYE])
+        ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2
+
+        eye_state = "Open"
+        if ear < EAR_THRESHOLD:
+            if eye_closed_start is None:
+                eye_closed_start = time.time()
+            elif time.time() - eye_closed_start > DROWSY_TIME:
+                eye_state = "Drowsy"
+        else:
+            eye_closed_start = None
+
+        # ---------- Eye Gaze ----------
+        left_iris = np.array([[face.landmark[i].x*w, face.landmark[i].y*h] for i in LEFT_IRIS])
+        right_iris = np.array([[face.landmark[i].x*w, face.landmark[i].y*h] for i in RIGHT_IRIS])
+
+        gaze_left = iris_offset(left_eye, left_iris)
+        gaze_right = iris_offset(right_eye, right_iris)
+        gaze_away = abs(gaze_left) > GAZE_THRESHOLD or abs(gaze_right) > GAZE_THRESHOLD
+
+        # ---------- Head Pose ----------
+        face_2d = np.array([[face.landmark[i].x*w, face.landmark[i].y*h] for i in LANDMARK_IDS], dtype=np.float64)
+        cam_matrix = np.array([[w,0,w/2],[0,w,h/2],[0,0,1]], dtype=np.float64)
+
+        distracted = False
+        success, rot_vec, _ = cv2.solvePnP(FACE_3D, face_2d, cam_matrix, np.zeros((4,1)))
+        if success:
+            rmat,_ = cv2.Rodrigues(rot_vec)
+            angles,_,_,_,_,_ = cv2.RQDecomp3x3(rmat)
+            angles = np.array(angles).flatten()
+            x,y,z = angles*360
+            distracted = abs(y)>20 or x>20
+
+        # ---------- Decision ----------
+        if eye_state == "Drowsy":
+            state = "Drowsy"
+        elif distracted or gaze_away:
+            state = "Distracted"
+        else:
+            state = "Attentive"
+
+    # ---------- Temporal Voting ----------
+    state_buffer.append(state)
+    final_state = "Attentive"
+    if state_buffer.count("Drowsy") > 10:
+        final_state = "Drowsy"
+    elif state_buffer.count("Distracted") > 15:
+        final_state = "Distracted"
+
+    # ---------- Time Stats ----------
+    now = time.time()
+    time_stats[last_state] += now - last_time
+    last_time = now
+    last_state = final_state
+    total = sum(time_stats.values())
+    perc = {k:(v/total)*100 if total else 0 for k,v in time_stats.items()}
+
+    # ---------- Dashboard ----------
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (w-260,20), (w-20,180), (0,0,0), -1)
+    cv2.addWeighted(overlay,0.6,frame,0.4,0,frame)
+
+    def bar(y,label,val,color):
+        cv2.rectangle(frame,(w-240,y),(w-240+int(150*val/100),y+20),color,-1)
+        cv2.putText(frame,f"{label}: {val:.1f}%",(w-240,y-5),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1)
+
+    bar(50,"Attentive",perc["Attentive"],(0,255,0))
+    bar(90,"Distracted",perc["Distracted"],(0,165,255))
+    bar(130,"Drowsy",perc["Drowsy"],(0,0,255))
+
+    cv2.putText(frame,f"State: {final_state}",(20,40),
+                cv2.FONT_HERSHEY_SIMPLEX,1,
+                (0,255,0) if final_state=="Attentive" else (0,0,255),2)
+
+    cv2.imshow("FocusGuard AI – FINAL", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
